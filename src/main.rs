@@ -7,41 +7,41 @@ use std::time::Duration;
 
 use crossterm::event::{poll, read, Event, KeyCode, KeyEvent};
 use mqttrs::{decode_slice, encode_slice, Connack, Packet, Publish};
-use tokio::io::BufReader;
+
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream, ToSocketAddrs};
-use tokio::net::tcp::{WriteHalf, ReadHalf};
+use tokio::net::{TcpListener, TcpStream};
+
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 use tokio::sync::{Mutex, RwLock};
 use tui::backend::CrosstermBackend;
 use tui::layout::{Constraint, Direction, Layout};
 use tui::style::{Color, Modifier, Style};
-use tui::widgets::{Block, BorderType, Borders, List, ListItem, ListState, Paragraph};
+use tui::widgets::{Block, BorderType, Borders, List, ListItem, ListState};
 use tui::Terminal;
 
 #[derive(Debug)]
 struct Session {
     addr: SocketAddr,
+    socket: Arc<Mutex<TcpStream>>,
     is_on: bool,
-    tx: Sender<([u8; 1024], usize)>,
 }
 
 impl Session {
-    fn new(addr: SocketAddr, tx: Sender<([u8; 1024], usize)>) -> Self {
+    fn new(addr: SocketAddr, socket: Arc<Mutex<TcpStream>>) -> Self {
         Session {
             addr,
+            socket,
             is_on: false,
-            tx,
         }
     }
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let listener = TcpListener::bind("192.168.0.108:1883").await?;
+    let listener = TcpListener::bind("192.168.0.110:1883").await?;
 
     let state: HashMap<SocketAddr, Session> = HashMap::new();
-    let state_ref = Arc::new(Mutex::new(state));
+    let state_ref = Arc::new(RwLock::new(state));
 
     let state = state_ref.clone();
     tokio::spawn(async move {
@@ -54,22 +54,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let state = state_ref.clone();
     loop {
         let (socket, addr) = listener.accept().await?;
+        let socket = Arc::new(Mutex::new(socket));
 
-        let mut session = state.lock().await;
-        let (tx, rx) = channel(1);
-        session.insert(addr, Session::new(addr, tx));
+        {
+            let socket = socket.clone();
+            let mut session = state.write().await;
+            session.insert(addr, Session::new(addr, socket));
+        }
 
-        let state = state.clone();
         tokio::spawn(async move {
-            client_listener(socket, rx).await;
+            client_listener(socket.clone()).await;
         });
     }
 }
 
 
-async fn client_listener(mut socket: TcpStream, rx: Receiver<([u8; 1024], usize)>) {
+async fn client_listener(socket: Arc<Mutex<TcpStream>>) {
     let mut buf = [0u8; 1024];
     loop {
+        let mut socket = socket.lock().await;
         socket.read(&mut buf).await.unwrap();
         match decode_slice(&buf) {
             Ok(Some(pkt)) => match pkt {
@@ -109,14 +112,14 @@ async fn client_listener(mut socket: TcpStream, rx: Receiver<([u8; 1024], usize)
 
 
 async fn tui_worker(
-    state: Arc<Mutex<HashMap<SocketAddr, Session>>>,
+    state: Arc<RwLock<HashMap<SocketAddr, Session>>>,
     mut terminal: Terminal<CrosstermBackend<Stdout>>,
-) -> () {
+) {
     terminal.clear().unwrap();
     let mut list_state = ListState::default();
     list_state.select(Some(0));
     loop {
-        let store = state.lock().await;
+        let mut store = state.write().await;
         terminal
             .draw(|rect| {
                 let size = rect.size();
@@ -181,7 +184,7 @@ async fn tui_worker(
                             ..
                         } => {
                             if let Some((id, session)) =
-                                store.iter().nth(list_state.selected().unwrap())
+                                store.iter_mut().nth(list_state.selected().unwrap())
                             {
                                 let mut buf = [0u8; 1024];
                                 let topic = format!("cmnd/{}/POWER", id);
@@ -190,10 +193,12 @@ async fn tui_worker(
                                     qospid: mqttrs::QosPid::AtMostOnce,
                                     retain: false,
                                     topic_name: &topic,
-                                    payload: "ON".as_bytes(),
+                                    payload: (if session.is_on {"OFF"} else {"ON"}).as_bytes(),
                                 });
                                 let r = encode_slice(&command, &mut buf);
-                                session.tx.send((buf, r.unwrap())).await;
+                                let mut s = session.socket.lock().await;
+                                s.write(&buf[..r.unwrap()]).await;
+                                session.is_on = !session.is_on;
                             }
                         }
                         _ => {}
@@ -201,7 +206,7 @@ async fn tui_worker(
                 }
             }
             Ok(false) => {}
-            Err(err) => panic!(err),
+            Err(err) => std::panic::panic_any(err),
         }
         std::thread::sleep(std::time::Duration::from_millis(200));
     }
