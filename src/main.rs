@@ -3,7 +3,9 @@ use std::collections::HashMap;
 
 use std::io::{self, Stdout};
 use std::net::SocketAddr;
+use std::str::FromStr;
 use std::sync::Arc;
+use std::task::Context;
 use std::time::Duration;
 
 use crossterm::event::{poll, read, Event, KeyCode, KeyEvent};
@@ -36,9 +38,33 @@ impl Session {
     }
 }
 
+use clap::Clap;
+
+#[derive(Clap, Debug)]
+#[clap(name = "mqtt-lights")]
+struct Args {
+    /// External IP to host on
+    external: String,
+
+    /// Port to host on
+    port: u32,
+
+    /// Number of times to greet
+    #[clap(short, long, default_value = "1")]
+    count: u8,
+}
+
+impl Args {
+    pub fn address(&self) -> String {
+        format!("{}:{}", self.external, self.port)
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let listener = TcpListener::bind("192.168.0.108:1883").await?;
+    let args = Args::parse();
+
+    let listener = TcpListener::bind(args.address()).await?;
 
     let state: HashMap<SocketAddr, Session> = HashMap::new();
     let state_ref = Arc::new(Mutex::new(state));
@@ -53,17 +79,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let state = state_ref.clone();
     loop {
-        let (socket, addr) = listener.accept().await?;
+        let (mut socket, addr) = listener.accept().await?;
 
-        let mut session = state.lock().await;
-        let (tx, rx) = channel(1);
-        session.insert(addr, Session::new(addr, tx));
+        // let mut session = state.lock().await;
+        let (buf_tx, buf_rx) = channel::<[u8; 1024]>(1);
+        let (msg_tx, msg_rx) = channel::<Msg>(1);
+        tokio::spawn(async move {
+            client_worker(&mut socket, msg_tx, buf_rx).await;
+        });
+        // session.insert(addr, Session::new(addr, tx));
 
         let state = state.clone();
         println!("found conn");
-        // tokio::spawn(async move {
-        //     client_worker(socket, rx).await;
-        // });
     }
 }
 
@@ -76,50 +103,88 @@ async fn reply<'a>(socket: &mut tokio::net::TcpStream, packet: &Packet<'a>, buf:
     }
 }
 
-// async fn client_worker(mut socket: TcpStream, mut rx: Receiver<([u8; 1024], usize)>) {
-//     let mut buf = [0u8; 1024];
-//     let (mut rd, mut wrt) = socket.split();
+enum Msg<'a> {
+    Packet(Packet<'a>),
+}
 
-//     tokio::spawn(async move {
-//         loop {
-//             if let Some((buf, size)) = rx.recv().await {
-//                 wrt.write(&buf[..size]).await;
-//             }
-//         }
-//     });
+async fn client_worker<'a>(
+    socket: &mut TcpStream,
+    mut tx: Sender<Msg<'a>>,
+    mut rx: Receiver<([u8; 1024])>,
+) {
+    let mut buf = [0u8; 1024];
 
-//     loop {
-//         rd.read(&mut buf).await.unwrap();
-//         match decode_slice(&buf) {
-//             Ok(Some(pkt)) => match pkt {
-//                 mqttrs::Packet::Connect(pkt) => {
-//                     let connack = Packet::Connack(Connack {
-//                         session_present: false,
-//                         code: mqttrs::ConnectReturnCode::Accepted,
-//                     });
-//                     reply(&mut socket, &connack, &mut buf).await;
-//                 }
-//                 Packet::Publish(pkt) => {
-//                     // println!(
-//                     //     "[{}]: {} [{:?}]",
-//                     //     pkt.topic_name,
-//                     //     String::from_utf8_lossy(&pkt.payload),
-//                     //     pkt.payload,
-//                     // )
-//                 }
-//                 Packet::Pingreq => {
-//                     reply(&mut socket, &Packet::Pingresp, &mut buf).await;
-//                 }
-//                 unknown => {
-//                     println!("Not handled: {:?}", unknown);
-//                 }
-//             },
-//             Ok(None) => {
-//                 println!("Decode error");
-//             }
-//             Err(error) => {
-//                 dbg!(error);
-//             }
-//         }
-//     }
-// }
+    loop {
+        if let Ok(buffer) = rx.try_recv(cx) {
+            socket.write(buffer);    
+        }
+        socket.read(&mut buf).await.unwrap();
+        match decode_slice(&buf) {
+            Ok(Some(packet)) => match packet {
+                p @ Packet::Connect(_) => {
+                    tx.send(Msg::Packet(p));
+                    let connack = Packet::Connack(Connack {
+                        session_present: false,
+                        code: mqttrs::ConnectReturnCode::Accepted,
+                    });
+                    reply(socket, &connack, &mut buf).await;
+                }
+                Packet::Pingreq => {
+                    reply(socket, &Packet::Pingresp, &mut buf).await;
+                }
+                Packet::Connack(_) => todo!(),
+                Packet::Publish(_) => todo!(),
+                Packet::Puback(_) => todo!(),
+                Packet::Pubrec(_) => todo!(),
+                Packet::Pubrel(_) => todo!(),
+                Packet::Pubcomp(_) => todo!(),
+                Packet::Subscribe(_) => todo!(),
+                Packet::Suback(_) => todo!(),
+                Packet::Unsubscribe(_) => todo!(),
+                Packet::Unsuback(_) => todo!(),
+                Packet::Pingreq => todo!(),
+                Packet::Pingresp => todo!(),
+                Packet::Disconnect => todo!(),
+            },
+            Ok(None) => {}
+            Err(decode_err) => {
+                dbg!(decode_err);
+            }
+        }
+    }
+
+    //     loop {
+    //         rd.read(&mut buf).await.unwrap();
+    //         match decode_slice(&buf) {
+    //             Ok(Some(pkt)) => match pkt {
+    //                 mqttrs::Packet::Connect(pkt) => {
+    //                     let connack = Packet::Connack(Connack {
+    //                         session_present: false,
+    //                         code: mqttrs::ConnectReturnCode::Accepted,
+    //                     });
+    //                     reply(&mut socket, &connack, &mut buf).await;
+    //                 }
+    //                 Packet::Publish(pkt) => {
+    //                     // println!(
+    //                     //     "[{}]: {} [{:?}]",
+    //                     //     pkt.topic_name,
+    //                     //     String::from_utf8_lossy(&pkt.payload),
+    //                     //     pkt.payload,
+    //                     // )
+    //                 }
+    //                 Packet::Pingreq => {
+    //                     reply(&mut socket, &Packet::Pingresp, &mut buf).await;
+    //                 }
+    //                 unknown => {
+    //                     println!("Not handled: {:?}", unknown);
+    //                 }
+    //             },
+    //             Ok(None) => {
+    //                 println!("Decode error");
+    //             }
+    //             Err(error) => {
+    //                 dbg!(error);
+    //             }
+    //         }
+    //     }
+}
