@@ -5,12 +5,12 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crossterm::event::{poll, read, Event, KeyCode, KeyEvent};
-use mqttrs::{decode_slice, encode_slice, Connack, Packet, Publish};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream, ToSocketAddrs};
-use tokio::sync::mpsc::{channel, Receiver, Sender};
-use tokio::sync::{Mutex, RwLock};
+use crossterm::event::{poll};
+
+
+
+
+use tokio::sync::{Mutex};
 use tui::backend::CrosstermBackend;
 use tui::layout::{Constraint, Direction, Layout};
 use tui::style::{Color, Modifier, Style};
@@ -86,13 +86,13 @@ impl DrawHandler for UiState {
 }
 
 pub async fn tui_worker(
-    state: Arc<Mutex<HashMap<SocketAddr, Session>>>,
+    _state: Arc<Mutex<HashMap<SocketAddr, Session>>>,
     mut terminal: Terminal<CrosstermBackend<Stdout>>,
-) -> () {
+) {
     terminal.clear().unwrap();
     loop {
         // let store = state.lock().await;
-        terminal.draw(|rect| {}).expect("???");
+        terminal.draw(|_rect| {}).expect("???");
 
         match poll(Duration::from_millis(200)) {
             Ok(true) => {}
